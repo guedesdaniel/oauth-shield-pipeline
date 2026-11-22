@@ -1,0 +1,17 @@
+[project]
+name = "oauth-shield-pipeline"
+version = "0.1.0"
+description = "Daily Airflow pipeline that scores OAuth 2.0 client applications for fraud risk (synthetic data, AWS S3 + Athena)."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]
