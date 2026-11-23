@@ -15,6 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from oauth_shield.network import random_br_subnet, random_host
+
 SCOPES = [
     "openid",
     "accounts",
@@ -45,6 +47,8 @@ EVENT_COLUMNS = [
     "requested_scope",
     "status_code",
 ]
+BENIGN_COLUMNS = ["client_id", "event_type", "subnet", "notified"]
+MIGRATION_COLUMNS = ["client_id", "migration_date", "new_subnet", "new_hosts", "notified"]
 
 
 @dataclass(frozen=True)
@@ -53,10 +57,16 @@ class GeneratorConfig:
     attack_rate: float = 0.04
     seed: int = 42
     volume_scale: float = 1.0
-    noise_new_ip_rate: float = 0.02
+    # Day-to-day host rotation inside one of the app's own /24 subnets (cloud autoscaling).
+    noise_ip_rotation_rate: float = 0.02
     noise_invalid_scope_rate: float = 0.005
     noise_invalid_client_rate: float = 0.01
     noise_rate_limited_rate: float = 0.003
+    # Legitimate subnet migrations: each app moves all traffic to a new /24 with this daily probability.
+    migration_rate_per_day: float = 1 / 600
+    # Share of migrations the client reports, so the declared registry (usual_ips) gets updated.
+    migration_notify_rate: float = 0.5
+    migration_epoch: str = "2026-10-01"
 
 
 def _br_ip(rng: np.random.Generator) -> str:
@@ -68,27 +78,90 @@ def _foreign_ip(rng: np.random.Generator) -> str:
 
 
 def build_client_profiles(cfg: GeneratorConfig) -> pd.DataFrame:
-    """Registry of client applications (stable across days for a given seed)."""
+    """Registry of client applications as registered (stable across days for a given seed).
+
+    Each app owns 1-3 home /24 subnets with 1-2 known hosts each. Use `registry_for_day` for the
+    registry as it stands on a given day (after reported migrations).
+    """
     rng = np.random.default_rng(cfg.seed)
     rows = []
     for i in range(cfg.n_clients):
-        n_ips = int(rng.integers(1, 4))
+        subnets: list[str] = []
+        while len(subnets) < int(rng.integers(1, 4)):
+            sn = random_br_subnet(rng)
+            if sn not in subnets:
+                subnets.append(sn)
+        hosts = sorted({random_host(sn, rng) for sn in subnets for _ in range(int(rng.integers(1, 3)))})
         n_scopes = int(rng.integers(2, 6))
         scopes = ["openid", *rng.choice(SCOPES[1:], size=n_scopes, replace=False).tolist()]
         rows.append(
             {
                 "client_id": f"sw-{i:05d}",
                 "home_country": "BR",
-                "usual_ips": " ".join(_br_ip(rng) for _ in range(n_ips)),
+                "usual_ips": " ".join(hosts),
+                "home_subnets": " ".join(subnets),
                 "allowed_scopes": " ".join(scopes),
-                "expected_daily_volume": int(np.clip(rng.lognormal(5.0, 1.0), 20, 3000)),
+                "expected_daily_volume": int(np.clip(rng.lognormal(5.2, 1.3), 20, 6000)),
             }
         )
     return pd.DataFrame(rows)
 
 
+def migrations_until(profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig) -> pd.DataFrame:
+    """Every legitimate subnet migration from `cfg.migration_epoch` up to and including `dt`.
+
+    Deterministic and stateless: each day draws from its own seeded stream, so any day can be
+    generated without the previous ones having been generated.
+    """
+    current = dict(zip(profiles["client_id"], profiles["home_subnets"].str.split(), strict=True))
+    rows = []
+    for day in pd.date_range(cfg.migration_epoch, dt, freq="D"):
+        rng = np.random.default_rng([cfg.seed, int(day.strftime("%Y%m%d")), 7])
+        moving = profiles["client_id"][rng.random(len(profiles)) < cfg.migration_rate_per_day]
+        for cid in moving:
+            new_subnet = random_br_subnet(rng)
+            while new_subnet in current[cid]:
+                new_subnet = random_br_subnet(rng)
+            hosts = sorted({random_host(new_subnet, rng) for _ in range(int(rng.integers(1, 4)))})
+            current[cid] = [new_subnet]
+            rows.append(
+                {
+                    "client_id": cid,
+                    "migration_date": day.strftime("%Y-%m-%d"),
+                    "new_subnet": new_subnet,
+                    "new_hosts": " ".join(hosts),
+                    "notified": bool(rng.random() < cfg.migration_notify_rate),
+                }
+            )
+    return pd.DataFrame(rows, columns=MIGRATION_COLUMNS)
+
+
+def _apply_latest(base: pd.DataFrame, migrations: pd.DataFrame) -> pd.DataFrame:
+    """Overwrite home_subnets/usual_ips with each client's latest migration in `migrations`."""
+    latest = migrations.sort_values("migration_date", kind="stable").groupby("client_id").tail(1)
+    out = base.set_index("client_id")
+    latest = latest.set_index("client_id")
+    out.loc[latest.index, "home_subnets"] = latest["new_subnet"]
+    out.loc[latest.index, "usual_ips"] = latest["new_hosts"]
+    return out.reset_index()
+
+
+def network_for_day(profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig) -> pd.DataFrame:
+    """Where each app's traffic really comes from on `dt` (all traffic follows the latest migration)."""
+    net = _apply_latest(profiles, migrations_until(profiles, dt, cfg))
+    return net.rename(columns={"usual_ips": "hosts"})[["client_id", "home_subnets", "hosts"]]
+
+
+def registry_for_day(profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig) -> pd.DataFrame:
+    """The declared registry on `dt`: only migrations the client reported are reflected."""
+    mig = migrations_until(profiles, dt, cfg)
+    return _apply_latest(profiles, mig[mig["notified"]])[profiles.columns]
+
+
 def _normal_traffic(profile: pd.Series, n: int, rng: np.random.Generator, cfg: GeneratorConfig) -> list[dict]:
-    usual_ips = profile["usual_ips"].split()
+    """`profile` carries the app's *current* network: `hosts` and `home_subnets`."""
+    hosts = profile["hosts"].split()
+    subnets = profile["home_subnets"].split()
     allowed = profile["allowed_scopes"].split()
     not_allowed = [s for s in SCOPES if s not in allowed]
     p_scope = cfg.noise_invalid_scope_rate
@@ -96,7 +169,10 @@ def _normal_traffic(profile: pd.Series, n: int, rng: np.random.Generator, cfg: G
     p_limit = p_client + cfg.noise_rate_limited_rate
     events = []
     for _ in range(n):
-        ip = _br_ip(rng) if rng.random() < cfg.noise_new_ip_rate else str(rng.choice(usual_ips))
+        if rng.random() < cfg.noise_ip_rotation_rate:
+            ip = random_host(str(rng.choice(subnets)), rng)
+        else:
+            ip = str(rng.choice(hosts))
         roll = rng.random()
         if roll < p_scope and not_allowed:
             scope, status = str(rng.choice(not_allowed)), STATUS_INVALID_SCOPE
@@ -126,7 +202,7 @@ def _attack_traffic(
 ) -> list[dict]:
     allowed = victim["allowed_scopes"].split()
     not_allowed = [s for s in SCOPES if s not in allowed] or ["payments"]
-    usual_ips = victim["usual_ips"].split()
+    usual_ips = victim["hosts"].split()  # the app's current hosts (after any migration)
     cid = victim["client_id"]
 
     if attack == "scope_probing":
@@ -201,22 +277,41 @@ def _attack_traffic(
     raise ValueError(f"unknown attack type: {attack}")
 
 
-def generate_day(profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (events, ground_truth) for one calendar day (dt = 'YYYY-MM-DD')."""
+def generate_day(
+    profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return (events, ground_truth, benign_events) for one calendar day (dt = 'YYYY-MM-DD').
+
+    `benign_events` lists today's legitimate subnet migrations (analysis only, like ground_truth).
+    """
     rng = np.random.default_rng(cfg.seed + int(dt.replace("-", "")))
+    # The app's real network today (hosts + home_subnets after any migration).
+    live = profiles.drop(columns="home_subnets").merge(network_for_day(profiles, dt, cfg), on="client_id")
 
     events: list[dict] = []
-    for _, profile in profiles.iterrows():
+    for _, profile in live.iterrows():
         n = int(rng.poisson(profile["expected_daily_volume"] * cfg.volume_scale))
         events.extend(_normal_traffic(profile, n, rng, cfg))
 
-    n_attacked = max(len(ATTACK_TYPES), round(len(profiles) * cfg.attack_rate))
-    victims = profiles.sample(n_attacked, random_state=int(rng.integers(1e9))).reset_index(drop=True)
+    n_attacked = max(len(ATTACK_TYPES), round(len(live) * cfg.attack_rate))
+    victims = live.sample(n_attacked, random_state=int(rng.integers(1e9))).reset_index(drop=True)
     truth = []
     for i, victim in victims.iterrows():
         attack = ATTACK_TYPES[i % len(ATTACK_TYPES)]
-        events.extend(_attack_traffic(attack, victim, profiles, rng))
+        events.extend(_attack_traffic(attack, victim, live, rng))
         truth.append({"client_id": victim["client_id"], "attack_type": attack})
+
+    mig = migrations_until(profiles, dt, cfg)
+    today = mig[mig["migration_date"] == dt]
+    benign = pd.DataFrame(
+        {
+            "client_id": today["client_id"].to_numpy(),
+            "event_type": "subnet_migration",
+            "subnet": today["new_subnet"].to_numpy(),
+            "notified": today["notified"].astype(bool).to_numpy(),
+        },
+        columns=BENIGN_COLUMNS,
+    )
 
     df = pd.DataFrame(events)
     day_start = pd.Timestamp(dt)
@@ -225,4 +320,4 @@ def generate_day(profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig) -> tuple
     df = df.sort_values("event_ts", kind="stable").reset_index(drop=True)
     df["event_id"] = [f"{dt.replace('-', '')}-{i:08d}" for i in range(len(df))]
     df["status_code"] = df["status_code"].astype("int64")
-    return df[EVENT_COLUMNS], pd.DataFrame(truth)
+    return df[EVENT_COLUMNS], pd.DataFrame(truth), benign

@@ -7,7 +7,7 @@ DT = "2026-11-20"
 
 @pytest.fixture(scope="session")
 def cfg():
-    return generator.GeneratorConfig(n_clients=120, seed=7)
+    return generator.GeneratorConfig(n_clients=120, seed=7, migration_rate_per_day=1 / 100)
 
 
 @pytest.fixture(scope="session")
@@ -28,6 +28,11 @@ def events(day):
 @pytest.fixture(scope="session")
 def ground_truth(day):
     return day[1]
+
+
+@pytest.fixture(scope="session")
+def benign_events(day):
+    return day[2]
 
 
 @pytest.fixture(scope="session")
