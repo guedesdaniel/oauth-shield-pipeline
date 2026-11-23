@@ -23,6 +23,7 @@ class Thresholds:
     suspicious_ip_min_clients: int = 10
     suspicious_ip_fail_ratio: float = 0.5
     suspicious_ip_min_hits: int = 10
+    new_subnet_scope_errors_min: int = 5
 
 
 WEIGHTS = {
@@ -31,6 +32,7 @@ WEIGHTS = {
     "s_foreign_geo": 40,
     "s_volume_burst": 25,
     "s_suspicious_ip": 40,
+    "s_new_subnet_scope_errors": 40,
 }
 REASONS = {
     "s_scope_probing": "repeated requests for unauthorized scopes",
@@ -38,11 +40,22 @@ REASONS = {
     "s_foreign_geo": "token requests from outside the home country",
     "s_volume_burst": "volume far above the expected baseline",
     "s_suspicious_ip": "targeted by an IP that is attacking many clients",
+    "s_new_subnet_scope_errors": "scope errors from a subnet not usual for this app",
 }
 HIGH, MEDIUM = 40, 20
 HIGH_LABEL = "HIGH"
 
 RISK_COLUMNS = ["client_id", "risk_score", "risk_level", "reasons", *WEIGHTS.keys()]
+DETECTION_COLUMNS = [
+    "run_date",
+    "flagged",
+    "true_positives",
+    "false_positives",
+    "false_negatives",
+    "precision",
+    "recall",
+    "baseline_ready",
+]
 
 
 def suspicious_ips(ip_daily: pd.DataFrame, t: Thresholds = Thresholds()) -> pd.Series:
@@ -51,10 +64,27 @@ def suspicious_ips(ip_daily: pd.DataFrame, t: Thresholds = Thresholds()) -> pd.S
     return ip_daily.loc[mask, "source_ip"]
 
 
+def new_subnet_scope_error_clients(
+    subnet_daily: pd.DataFrame, baseline: pd.DataFrame, t: Thresholds = Thresholds()
+) -> set[str]:
+    """Clients with >= N scope errors today from a /24 that is not usual for them.
+
+    Counted per (client, subnet) and never divided by the client's total volume, so a big app
+    cannot dilute a small, focused attack. A subnet absent from the baseline counts as not usual.
+    """
+    usual = baseline.loc[baseline["is_usual"], ["client_id", "subnet"]].assign(usual=True)
+    df = subnet_daily.merge(usual, on=["client_id", "subnet"], how="left")
+    hits = df[df["usual"].isna() & (df["invalid_scope_count"] >= t.new_subnet_scope_errors_min)]
+    return set(hits["client_id"])
+
+
 def score_clients(
     client_daily: pd.DataFrame,
     ip_daily: pd.DataFrame,
     events: pd.DataFrame,
+    subnet_daily: pd.DataFrame | None = None,
+    baseline: pd.DataFrame | None = None,
+    baseline_ready: bool = False,
     t: Thresholds = Thresholds(),
 ) -> pd.DataFrame:
     bad_ips = set(suspicious_ips(ip_daily, t))
@@ -72,6 +102,10 @@ def score_clients(
     df["s_foreign_geo"] = df["foreign_country_requests"] >= t.foreign_min
     df["s_volume_burst"] = df["total_requests"] / df["expected_daily_volume"].clip(lower=1) >= t.burst_ratio
     df["s_suspicious_ip"] = df["suspicious_ip_hits"] >= t.suspicious_ip_min_hits
+    new_subnet = set()
+    if baseline_ready and subnet_daily is not None and baseline is not None:
+        new_subnet = new_subnet_scope_error_clients(subnet_daily, baseline, t)
+    df["s_new_subnet_scope_errors"] = df["client_id"].isin(new_subnet)
 
     signals = list(WEIGHTS)
     df["risk_score"] = sum(df[s].astype("int64") * w for s, w in WEIGHTS.items()).clip(upper=100)
@@ -85,7 +119,9 @@ def score_clients(
     return df[RISK_COLUMNS].sort_values("risk_score", ascending=False).reset_index(drop=True)
 
 
-def detection_metrics(scores: pd.DataFrame, ground_truth: pd.DataFrame, dt: str) -> pd.DataFrame:
+def detection_metrics(
+    scores: pd.DataFrame, ground_truth: pd.DataFrame, dt: str, baseline_ready: bool = False
+) -> pd.DataFrame:
     """Compare HIGH-risk clients with the injected attacks (synthetic ground truth)."""
     flagged = set(scores.loc[scores["risk_level"] == HIGH_LABEL, "client_id"])
     attacked = set(ground_truth["client_id"])
@@ -102,6 +138,8 @@ def detection_metrics(scores: pd.DataFrame, ground_truth: pd.DataFrame, dt: str)
                 "false_negatives": fn,
                 "precision": tp / (tp + fp) if flagged else 0.0,
                 "recall": tp / (tp + fn) if attacked else 0.0,
+                "baseline_ready": bool(baseline_ready),
             }
-        ]
+        ],
+        columns=DETECTION_COLUMNS,
     )
