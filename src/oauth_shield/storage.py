@@ -61,3 +61,30 @@ class Storage:
             return pd.read_parquet(self.data_dir / key)
         body = self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
         return pd.read_parquet(io.BytesIO(body))
+
+    def _read_if_exists(self, layer: str, table: str, dt: str) -> pd.DataFrame | None:
+        if self.backend == "local":
+            path = self.data_dir / self.key(layer, table, dt)
+            return pd.read_parquet(path) if path.exists() else None
+        from botocore.exceptions import ClientError
+
+        try:
+            return self.read(layer, table, dt)
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+                return None
+            raise
+
+    def read_many(self, layer: str, table: str, dts: list[str]) -> tuple[pd.DataFrame, int]:
+        """Concatenate the partitions that exist (missing days are skipped), adding a `dt` column.
+
+        Returns (frame, number_of_partitions_found).
+        """
+        frames = []
+        for dt in dts:
+            df = self._read_if_exists(layer, table, dt)
+            if df is not None:
+                frames.append(df.assign(dt=dt))
+        if not frames:
+            return pd.DataFrame(), 0
+        return pd.concat(frames, ignore_index=True), len(frames)
