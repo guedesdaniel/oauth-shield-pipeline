@@ -7,7 +7,7 @@ locals {
   # (no crawlers, no MSCK REPAIR: new dt= partitions are queryable immediately).
   tables = {
     oauth_events = {
-      prefix  = "bronze/oauth_events"
+      prefix = "bronze/oauth_events"
       columns = {
         event_id        = "string"
         event_ts        = "timestamp"
@@ -19,7 +19,7 @@ locals {
       }
     }
     client_daily = {
-      prefix  = "silver/client_daily"
+      prefix = "silver/client_daily"
       columns = {
         client_id                 = "string"
         total_requests            = "bigint"
@@ -35,7 +35,7 @@ locals {
       }
     }
     ip_daily = {
-      prefix  = "silver/ip_daily"
+      prefix = "silver/ip_daily"
       columns = {
         source_ip        = "string"
         country          = "string"
@@ -45,7 +45,7 @@ locals {
       }
     }
     risk_scores = {
-      prefix  = "gold/risk_scores"
+      prefix = "gold/risk_scores"
       columns = {
         client_id         = "string"
         risk_score        = "bigint"
@@ -59,7 +59,7 @@ locals {
       }
     }
     detection_metrics = {
-      prefix  = "gold/detection_metrics"
+      prefix = "gold/detection_metrics"
       columns = {
         run_date        = "string"
         flagged         = "bigint"
@@ -103,7 +103,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "lake" {
     id     = "expire-raw-events"
     status = "Enabled"
     filter {
-      prefix  = "bronze/"
+      prefix = "bronze/"
     }
     expiration {
       days = 30
@@ -114,7 +114,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "lake" {
     id     = "expire-athena-results"
     status = "Enabled"
     filter {
-      prefix  = "athena-results/"
+      prefix = "athena-results/"
     }
     expiration {
       days = 7

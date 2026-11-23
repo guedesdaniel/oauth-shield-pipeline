@@ -13,3 +13,4 @@ infra/terraform/.terraform/
 *.tfvars
 !*.tfvars.example
 COMO_COMECAR.md
+CLAUDE.md
