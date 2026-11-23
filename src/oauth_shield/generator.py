@@ -30,7 +30,17 @@ SCOPES = [
     "financings",
 ]
 FOREIGN_COUNTRIES = ["RU", "CN", "NG", "NL", "VN", "RO", "US", "IN"]
-ATTACK_TYPES = ["scope_probing", "credential_stuffing", "geo_anomaly", "volume_burst"]
+ATTACK_TYPES = ["scope_probing", "credential_stuffing", "geo_anomaly", "volume_burst", "new_subnet_probing"]
+
+# Attack intensities (inclusive ranges). They deliberately straddle the detection thresholds in
+# risk.py, so some attacks slip through: the point is to measure detection, not to guarantee it.
+SCOPE_PROBING_ERRORS = (5, 60)
+STUFFING_VICTIM_HITS = (10, 60)
+STUFFING_SPRAY_CLIENTS = (6, 15)
+GEO_REQUESTS = (2, 40)
+BURST_MULTIPLIER = (2.0, 6.0)
+NEW_SUBNET_REQUESTS = (8, 40)
+NEW_SUBNET_SCOPE_ERROR_SHARE = (0.60, 0.85)
 
 STATUS_OK = 200
 STATUS_INVALID_SCOPE = 400
@@ -67,6 +77,8 @@ class GeneratorConfig:
     # Share of migrations the client reports, so the declared registry (usual_ips) gets updated.
     migration_notify_rate: float = 0.5
     migration_epoch: str = "2026-10-01"
+    # new_subnet_probing only hits high-volume apps (top decile), where scope errors get diluted.
+    new_subnet_victim_quantile: float = 0.9
 
 
 def _br_ip(rng: np.random.Generator) -> str:
@@ -194,6 +206,11 @@ def _normal_traffic(profile: pd.Series, n: int, rng: np.random.Generator, cfg: G
     return events
 
 
+def _between(rng: np.random.Generator, bounds: tuple[int, int]) -> int:
+    """Random integer in an inclusive range."""
+    return int(rng.integers(bounds[0], bounds[1] + 1))
+
+
 def _attack_traffic(
     attack: str,
     victim: pd.Series,
@@ -215,7 +232,7 @@ def _attack_traffic(
                 "requested_scope": str(rng.choice(not_allowed)),
                 "status_code": STATUS_INVALID_SCOPE,
             }
-            for _ in range(int(rng.integers(40, 121)))
+            for _ in range(_between(rng, SCOPE_PROBING_ERRORS))
         ]
 
     if attack == "credential_stuffing":
@@ -229,9 +246,10 @@ def _attack_traffic(
                 "requested_scope": str(rng.choice(allowed)),
                 "status_code": STATUS_INVALID_CLIENT,
             }
-            for _ in range(int(rng.integers(30, 81)))
+            for _ in range(_between(rng, STUFFING_VICTIM_HITS))
         ]
-        others = profiles[profiles["client_id"] != cid].sample(15, random_state=int(rng.integers(1e9)))
+        n_spray = _between(rng, STUFFING_SPRAY_CLIENTS)
+        others = profiles[profiles["client_id"] != cid].sample(n_spray, random_state=int(rng.integers(1e9)))
         for _, other in others.iterrows():
             for _ in range(int(rng.integers(1, 3))):
                 events.append(
@@ -256,12 +274,12 @@ def _attack_traffic(
                 "requested_scope": str(rng.choice(allowed)),
                 "status_code": STATUS_OK,
             }
-            for _ in range(int(rng.integers(30, 101)))
+            for _ in range(_between(rng, GEO_REQUESTS))
         ]
 
     if attack == "volume_burst":
         # Token farming: several times the usual volume, half of it from unseen IPs.
-        n = int(victim["expected_daily_volume"] * rng.uniform(5, 8))
+        n = int(victim["expected_daily_volume"] * rng.uniform(*BURST_MULTIPLIER))
         new_ips = [_br_ip(rng) for _ in range(5)]
         return [
             {
@@ -272,6 +290,27 @@ def _attack_traffic(
                 "status_code": STATUS_OK,
             }
             for _ in range(n)
+        ]
+
+    if attack == "new_subnet_probing":
+        # Stolen credentials used once, from a Brazilian IP in a /24 the app never uses: a few tokens
+        # for granted scopes plus mostly attempts at scopes it was never granted. Gone the next day.
+        homes = victim["home_subnets"].split()
+        subnet = random_br_subnet(rng)
+        while subnet in homes:
+            subnet = random_br_subnet(rng)
+        ip = random_host(subnet, rng)
+        n = _between(rng, NEW_SUBNET_REQUESTS)
+        n_err = round(n * rng.uniform(*NEW_SUBNET_SCOPE_ERROR_SHARE))
+        return [
+            {
+                "client_id": cid,
+                "source_ip": ip,
+                "country": "BR",
+                "requested_scope": str(rng.choice(not_allowed if k < n_err else allowed)),
+                "status_code": STATUS_INVALID_SCOPE if k < n_err else STATUS_OK,
+            }
+            for k in range(n)
         ]
 
     raise ValueError(f"unknown attack type: {attack}")
@@ -294,10 +333,15 @@ def generate_day(
         events.extend(_normal_traffic(profile, n, rng, cfg))
 
     n_attacked = max(len(ATTACK_TYPES), round(len(live) * cfg.attack_rate))
-    victims = live.sample(n_attacked, random_state=int(rng.integers(1e9))).reset_index(drop=True)
+    attacks = [ATTACK_TYPES[i % len(ATTACK_TYPES)] for i in range(n_attacked)]
+    n_new_subnet = attacks.count("new_subnet_probing")
+    big = live[live["expected_daily_volume"] >= live["expected_daily_volume"].quantile(cfg.new_subnet_victim_quantile)]
+    big_victims = big.sample(n_new_subnet, random_state=int(rng.integers(1e9)))
+    rest = live.drop(index=big_victims.index).sample(n_attacked - n_new_subnet, random_state=int(rng.integers(1e9)))
+    big_iter, rest_iter = big_victims.iterrows(), rest.iterrows()
     truth = []
-    for i, victim in victims.iterrows():
-        attack = ATTACK_TYPES[i % len(ATTACK_TYPES)]
+    for attack in attacks:
+        _, victim = next(big_iter) if attack == "new_subnet_probing" else next(rest_iter)
         events.extend(_attack_traffic(attack, victim, live, rng))
         truth.append({"client_id": victim["client_id"], "attack_type": attack})
 

@@ -35,6 +35,23 @@ def test_every_attack_type_is_injected(ground_truth):
     assert ground_truth["client_id"].is_unique
 
 
+def test_new_subnet_probing_shape(profiles, cfg, events, ground_truth):
+    net = generator.network_for_day(profiles, DT, cfg).set_index("client_id")
+    vol = profiles.set_index("client_id")["expected_daily_volume"]
+    q = vol.quantile(cfg.new_subnet_victim_quantile)
+    victims = ground_truth.loc[ground_truth["attack_type"] == "new_subnet_probing", "client_id"]
+    assert len(victims) > 0
+    for cid in victims:
+        assert vol[cid] >= q
+        homes = set(net.loc[cid, "home_subnets"].split())
+        mine = events[(events["client_id"] == cid) & (events["country"] == "BR")]
+        off = mine[~mine["source_ip"].map(subnet_of).isin(homes)]
+        assert 8 <= len(off) <= 40
+        assert off["source_ip"].nunique() == 1
+        assert off["source_ip"].iloc[0].startswith("177.")
+        assert (off["status_code"] == 400).mean() >= 0.5
+
+
 def test_profiles_have_home_subnets(profiles):
     for _, p in profiles.iterrows():
         homes = set(p["home_subnets"].split())
