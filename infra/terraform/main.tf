@@ -56,6 +56,8 @@ locals {
         s_foreign_geo     = "boolean"
         s_volume_burst    = "boolean"
         s_suspicious_ip   = "boolean"
+        # learned-baseline signal: scope errors from a /24 the app does not usually use
+        s_new_subnet_scope_errors = "boolean"
       }
     }
     detection_metrics = {
@@ -68,6 +70,47 @@ locals {
         false_negatives = "bigint"
         precision       = "double"
         recall          = "double"
+        baseline_ready  = "boolean"
+      }
+    }
+    client_subnet_daily = {
+      prefix = "silver/client_subnet_daily"
+      columns = {
+        client_id           = "string"
+        subnet              = "string"
+        total_requests      = "bigint"
+        success_count       = "bigint"
+        invalid_scope_count = "bigint"
+        distinct_ips        = "bigint"
+      }
+    }
+    client_subnet_baseline = {
+      prefix = "silver/client_subnet_baseline"
+      columns = {
+        client_id             = "string"
+        subnet                = "string"
+        window_tokens         = "bigint"
+        token_share           = "double"
+        days_seen             = "bigint"
+        is_usual              = "boolean"
+        window_days_available = "bigint"
+      }
+    }
+    # Evaluation-only tables: which apps were attacked, and which legitimately migrated.
+    ground_truth = {
+      prefix = "bronze/ground_truth"
+      columns = {
+        client_id   = "string"
+        attack_type = "string"
+      }
+    }
+    benign_events = {
+      prefix = "bronze/benign_events"
+      columns = {
+        client_id  = "string"
+        event_type = "string"
+        subnet     = "string"
+        notified   = "boolean"
       }
     }
   }

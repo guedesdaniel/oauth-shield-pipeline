@@ -1,9 +1,11 @@
 -- Run in the Athena console with workgroup "oauth-shield" and database "oauth_shield".
+-- Partitions (dt) are UTC dates. Replace '2026-11-22' with the day you want; current_date can
+-- already be "tomorrow" in UTC while it is still today in Brazil (after 21:00 BRT).
 
--- 1) Today's high-risk client applications, with the reasons that fired
+-- 1) High-risk client applications of a day, with the reasons that fired
 SELECT client_id, risk_score, reasons
 FROM risk_scores
-WHERE dt = CAST(current_date AS varchar) AND risk_level = 'HIGH'
+WHERE dt = '2026-11-22' AND risk_level = 'HIGH'
 ORDER BY risk_score DESC;
 
 -- 2) Detection quality over time (synthetic ground truth)
@@ -26,3 +28,13 @@ FROM client_daily
 WHERE dt >= CAST(current_date - INTERVAL '7' DAY AS varchar)
 ORDER BY error_pct DESC
 LIMIT 50;
+
+-- 5) Scope errors from a /24 the app does not usually use (learned from the previous 14 days)
+SELECT d.dt, d.client_id, d.subnet, d.invalid_scope_count, d.success_count, d.total_requests
+FROM client_subnet_daily d
+LEFT JOIN client_subnet_baseline b
+  ON b.dt = d.dt AND b.client_id = d.client_id AND b.subnet = d.subnet
+WHERE d.dt = '2026-11-22'
+  AND COALESCE(b.is_usual, false) = false
+  AND d.invalid_scope_count >= 5
+ORDER BY d.invalid_scope_count DESC;
