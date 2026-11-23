@@ -5,6 +5,16 @@ from __future__ import annotations
 import pandas as pd
 
 from oauth_shield.generator import STATUS_INVALID_CLIENT, STATUS_INVALID_SCOPE, STATUS_OK
+from oauth_shield.network import subnet_of
+
+CLIENT_SUBNET_DAILY_COLUMNS = [
+    "client_id",
+    "subnet",
+    "total_requests",
+    "success_count",
+    "invalid_scope_count",
+    "distinct_ips",
+]
 
 CLIENT_DAILY_COLUMNS = [
     "client_id",
@@ -57,6 +67,28 @@ def client_daily(events: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
     out[count_cols] = out[count_cols].astype("int64")
     out["expected_daily_volume"] = out["expected_daily_volume"].astype("int64")
     return out[CLIENT_DAILY_COLUMNS]
+
+
+def client_subnet_daily(events: pd.DataFrame) -> pd.DataFrame:
+    """One row per (client, /24 subnet): the daily input of the learned subnet baseline."""
+    df = events.assign(
+        subnet=events["source_ip"].map(subnet_of),
+        is_ok=events["status_code"] == STATUS_OK,
+        is_invalid_scope=events["status_code"] == STATUS_INVALID_SCOPE,
+    )
+    out = (
+        df.groupby(["client_id", "subnet"])
+        .agg(
+            total_requests=("event_id", "size"),
+            success_count=("is_ok", "sum"),
+            invalid_scope_count=("is_invalid_scope", "sum"),
+            distinct_ips=("source_ip", "nunique"),
+        )
+        .reset_index()
+    )
+    for col in CLIENT_SUBNET_DAILY_COLUMNS[2:]:
+        out[col] = out[col].astype("int64")
+    return out[CLIENT_SUBNET_DAILY_COLUMNS]
 
 
 def ip_daily(events: pd.DataFrame) -> pd.DataFrame:
