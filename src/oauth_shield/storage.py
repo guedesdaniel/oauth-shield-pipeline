@@ -45,6 +45,11 @@ class Storage:
 
     def write(self, df: pd.DataFrame, layer: str, table: str, dt: str) -> str:
         key = self.key(layer, table, dt)
+        # An all-empty object column would be written as Parquet type `null` and break reading the
+        # table as a whole (pandas/DuckDB/Athena); write it as string like the non-empty days.
+        empty_obj = [c for c in df.columns if df[c].dtype == object and df[c].isna().all()]
+        if empty_obj:
+            df = df.astype(dict.fromkeys(empty_obj, "string"))
         if self.backend == "local":
             path = self.data_dir / key
             path.parent.mkdir(parents=True, exist_ok=True)

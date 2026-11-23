@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from oauth_shield.storage import Storage
@@ -64,3 +65,14 @@ def test_read_many_s3_reraises_other_errors():
     store._s3 = _FakeS3("AccessDenied")
     with pytest.raises(ClientError):
         store.read_many("silver", "t", ["2026-11-01"])
+
+
+def test_empty_partition_keeps_string_columns(tmp_path):
+    """An empty day (e.g. the first baseline, a day without benign events) must not write `null` columns,
+    or the table can no longer be read as a whole by pandas/DuckDB/Athena."""
+    store = Storage(backend="local", data_dir=str(tmp_path))
+    empty = pd.DataFrame({"client_id": pd.Series(dtype="object"), "n": pd.Series(dtype="int64")})
+    store.write(empty, "silver", "t", "2026-11-01")
+    store.write(pd.DataFrame({"client_id": ["a"], "n": [1]}), "silver", "t", "2026-11-02")
+    df = pd.read_parquet(tmp_path / "silver" / "t")
+    assert len(df) == 1 and df["client_id"].iloc[0] == "a"
