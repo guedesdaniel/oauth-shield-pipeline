@@ -60,15 +60,30 @@ def _score(subnet_rows, ready=True, extra_clients=(), total=100):
     cd = pd.DataFrame([_quiet("a", total), *(_quiet(c) for c in extra_clients)])
     sd = pd.DataFrame(
         [
-            {"client_id": c, "subnet": s, "total_requests": n, "success_count": 0, "invalid_scope_count": n,
-             "distinct_ips": 1}
+            {
+                "client_id": c,
+                "subnet": s,
+                "total_requests": n,
+                "success_count": 0,
+                "invalid_scope_count": n,
+                "distinct_ips": 1,
+            }
             for c, s, n in subnet_rows
         ],
         columns=aggregate.CLIENT_SUBNET_DAILY_COLUMNS,
     )
     hist = pd.DataFrame(
-        [{"client_id": "a", "subnet": "1.1.1.0/24", "total_requests": 500, "success_count": 500,
-          "invalid_scope_count": 0, "distinct_ips": 1, "dt": "2026-11-01"}]
+        [
+            {
+                "client_id": "a",
+                "subnet": "1.1.1.0/24",
+                "total_requests": 500,
+                "success_count": 500,
+                "invalid_scope_count": 0,
+                "distinct_ips": 1,
+                "dt": "2026-11-01",
+            }
+        ]
     )
     bl = baseline.build_baseline(hist, 14)
     events = pd.DataFrame(columns=["client_id", "source_ip"])
