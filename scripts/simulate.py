@@ -46,7 +46,9 @@ def simulate(end: str, days: int, cfg: generator.GeneratorConfig) -> tuple[pd.Da
         metrics = risk.detection_metrics(scores, truth, dt, baseline_ready=ready).iloc[0].to_dict()
         high = set(scores.loc[scores["risk_level"] == "HIGH", "client_id"])
         false_pos = high - set(truth["client_id"])
-        metrics["fp_migrated_today"] = len(false_pos & set(benign["client_id"]))
+        for kind in generator.BENIGN_EVENT_TYPES:
+            explained = set(benign.loc[benign["event_type"] == kind, "client_id"])
+            metrics[f"fp_{kind}"] = len(false_pos & explained)
         metrics["fp_new_subnet_signal"] = int(
             scores.loc[scores["client_id"].isin(false_pos), "s_new_subnet_scope_errors"].sum()
         )
@@ -73,7 +75,8 @@ def main() -> None:
     print("\nRecall by attack type (evaluated days):")
     print(evaluated.groupby("attack_type")["caught"].agg(["mean", "sum", "count"]).round(3).to_string())
     print(f"\nFalse positives on evaluated days: {int(ready['false_positives'].sum())}")
-    print(f"  of which apps that migrated that day: {int(ready['fp_migrated_today'].sum())}")
+    for kind in generator.BENIGN_EVENT_TYPES:
+        print(f"  explained by benign {kind}: {int(ready[f'fp_{kind}'].sum())}")
     print(f"  of which raised by the new-subnet signal: {int(ready['fp_new_subnet_signal'].sum())}")
 
 

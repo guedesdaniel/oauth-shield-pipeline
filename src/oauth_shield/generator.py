@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from oauth_shield.network import random_br_subnet, random_host
+from oauth_shield.network import random_br_subnet, random_host, subnet_of
 
 SCOPES = [
     "openid",
@@ -37,10 +37,15 @@ ATTACK_TYPES = ["scope_probing", "credential_stuffing", "geo_anomaly", "volume_b
 SCOPE_PROBING_ERRORS = (5, 60)
 STUFFING_VICTIM_HITS = (10, 60)
 STUFFING_SPRAY_CLIENTS = (6, 15)
+STUFFING_FOREIGN_SHARE = 0.5  # otherwise the attacker hides behind a Brazilian IP
 GEO_REQUESTS = (2, 40)
-BURST_MULTIPLIER = (2.0, 6.0)
-NEW_SUBNET_REQUESTS = (8, 40)
-NEW_SUBNET_SCOPE_ERROR_SHARE = (0.60, 0.85)
+BURST_MULTIPLIER = (0.8, 5.0)  # extra volume on top of normal traffic: total 1.8x-6x
+NEW_SUBNET_REQUESTS = (4, 30)
+NEW_SUBNET_SCOPE_ERROR_SHARE = (0.40, 0.85)
+
+# Legitimate behaviour that looks like an attack (false-positive sources, recorded in benign_events).
+MISCONFIG_SCOPE_SHARE = (0.03, 0.15)  # buggy release asks for a scope it was never granted
+FOREIGN_REGION_REQUESTS = (3, 30)  # app serves a few requests from a foreign cloud region
 
 STATUS_OK = 200
 STATUS_INVALID_SCOPE = 400
@@ -58,6 +63,7 @@ EVENT_COLUMNS = [
     "status_code",
 ]
 BENIGN_COLUMNS = ["client_id", "event_type", "subnet", "notified"]
+BENIGN_EVENT_TYPES = ["subnet_migration", "misconfigured_scope", "foreign_region"]
 MIGRATION_COLUMNS = ["client_id", "migration_date", "new_subnet", "new_hosts", "notified"]
 
 
@@ -79,6 +85,9 @@ class GeneratorConfig:
     migration_epoch: str = "2026-10-01"
     # new_subnet_probing only hits high-volume apps (top decile), where scope errors get diluted.
     new_subnet_victim_quantile: float = 0.9
+    # Daily probability, per app not under attack, of each legitimate lookalike behaviour.
+    misconfigured_scope_rate_per_day: float = 0.01
+    foreign_region_rate_per_day: float = 0.005
 
 
 def _br_ip(rng: np.random.Generator) -> str:
@@ -236,8 +245,11 @@ def _attack_traffic(
         ]
 
     if attack == "credential_stuffing":
-        # One foreign IP hammers the victim and sprays a few attempts at many other clients.
-        ip, country = _foreign_ip(rng), str(rng.choice(FOREIGN_COUNTRIES))
+        # One IP hammers the victim and sprays a few attempts at many other clients.
+        if rng.random() < STUFFING_FOREIGN_SHARE:
+            ip, country = _foreign_ip(rng), str(rng.choice(FOREIGN_COUNTRIES))
+        else:
+            ip, country = _br_ip(rng), "BR"
         events = [
             {
                 "client_id": cid,
@@ -316,6 +328,40 @@ def _attack_traffic(
     raise ValueError(f"unknown attack type: {attack}")
 
 
+def _lookalike_traffic(kind: str, app: pd.Series, rng: np.random.Generator) -> tuple[list[dict], str]:
+    """Legitimate traffic that trips a rule. Returns (events, subnet involved)."""
+    cid, allowed = app["client_id"], app["allowed_scopes"].split()
+    if kind == "misconfigured_scope":
+        not_allowed = [s for s in SCOPES if s not in allowed] or ["payments"]
+        host = str(rng.choice(app["hosts"].split()))
+        n = max(1, round(app["expected_daily_volume"] * rng.uniform(*MISCONFIG_SCOPE_SHARE)))
+        events = [
+            {
+                "client_id": cid,
+                "source_ip": host,
+                "country": "BR",
+                "requested_scope": str(rng.choice(not_allowed)),
+                "status_code": STATUS_INVALID_SCOPE,
+            }
+            for _ in range(n)
+        ]
+        return events, subnet_of(host)
+    if kind == "foreign_region":
+        ip, country = _foreign_ip(rng), str(rng.choice(FOREIGN_COUNTRIES))
+        events = [
+            {
+                "client_id": cid,
+                "source_ip": ip,
+                "country": country,
+                "requested_scope": str(rng.choice(allowed)),
+                "status_code": STATUS_OK,
+            }
+            for _ in range(_between(rng, FOREIGN_REGION_REQUESTS))
+        ]
+        return events, subnet_of(ip)
+    raise ValueError(f"unknown lookalike: {kind}")
+
+
 def generate_day(
     profiles: pd.DataFrame, dt: str, cfg: GeneratorConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -347,15 +393,28 @@ def generate_day(
 
     mig = migrations_until(profiles, dt, cfg)
     today = mig[mig["migration_date"] == dt]
-    benign = pd.DataFrame(
+    benign_rows = [
         {
-            "client_id": today["client_id"].to_numpy(),
+            "client_id": m.client_id,
             "event_type": "subnet_migration",
-            "subnet": today["new_subnet"].to_numpy(),
-            "notified": today["notified"].astype(bool).to_numpy(),
-        },
-        columns=BENIGN_COLUMNS,
-    )
+            "subnet": m.new_subnet,
+            "notified": bool(m.notified),
+        }
+        for m in today.itertuples()
+    ]
+    # Lookalikes come from their own seeded stream, so they never shift the attack draws above.
+    lrng = np.random.default_rng([cfg.seed, int(dt.replace("-", "")), 11])
+    calm = live[~live["client_id"].isin({t["client_id"] for t in truth})]
+    for kind, rate in (
+        ("misconfigured_scope", cfg.misconfigured_scope_rate_per_day),
+        ("foreign_region", cfg.foreign_region_rate_per_day),
+    ):
+        for _, app in calm[lrng.random(len(calm)) < rate].iterrows():
+            lookalike, subnet = _lookalike_traffic(kind, app, lrng)
+            events.extend(lookalike)
+            benign_rows.append({"client_id": app["client_id"], "event_type": kind, "subnet": subnet, "notified": False})
+    benign = pd.DataFrame(benign_rows, columns=BENIGN_COLUMNS)
+    benign["notified"] = benign["notified"].astype(bool)
 
     df = pd.DataFrame(events)
     day_start = pd.Timestamp(dt)

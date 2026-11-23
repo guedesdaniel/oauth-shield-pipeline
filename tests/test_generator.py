@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pandas as pd
 
 from oauth_shield import generator
@@ -46,10 +48,11 @@ def test_new_subnet_probing_shape(profiles, cfg, events, ground_truth):
         homes = set(net.loc[cid, "home_subnets"].split())
         mine = events[(events["client_id"] == cid) & (events["country"] == "BR")]
         off = mine[~mine["source_ip"].map(subnet_of).isin(homes)]
-        assert 8 <= len(off) <= 40
+        lo, hi = generator.NEW_SUBNET_REQUESTS
+        assert lo <= len(off) <= hi
         assert off["source_ip"].nunique() == 1
         assert off["source_ip"].iloc[0].startswith("177.")
-        assert (off["status_code"] == 400).mean() >= 0.5
+        assert (off["status_code"] == 400).mean() >= 0.35
 
 
 def test_profiles_have_home_subnets(profiles):
@@ -68,8 +71,12 @@ def test_migrations_are_deterministic_and_bounded(profiles, cfg):
 
 
 def _normal_br(events, ground_truth):
-    """Events of clients not attacked today, from Brazil (attacks add other IPs by design)."""
-    return events[~events["client_id"].isin(ground_truth["client_id"]) & (events["country"] == "BR")]
+    """Events of clients not attacked today, from Brazil (attacks add other IPs by design).
+
+    401s are excluded: credential stuffing sprays invalid_client attempts at non-victims too.
+    """
+    calm = ~events["client_id"].isin(ground_truth["client_id"])
+    return events[calm & (events["country"] == "BR") & (events["status_code"] != 401)]
 
 
 def test_migrated_client_traffic_moves_entirely(profiles, cfg, events, ground_truth):
@@ -105,5 +112,22 @@ def test_rotation_stays_in_home_subnet(profiles, cfg, events, ground_truth):
 def test_benign_events_are_todays_migrations(profiles, cfg, benign_events):
     assert list(benign_events.columns) == generator.BENIGN_COLUMNS
     mig = generator.migrations_until(profiles, DT, cfg)
-    assert set(benign_events["client_id"]) == set(mig.loc[mig["migration_date"] == DT, "client_id"])
-    assert (benign_events["event_type"] == "subnet_migration").all()
+    migrations = benign_events[benign_events["event_type"] == "subnet_migration"]
+    assert set(migrations["client_id"]) == set(mig.loc[mig["migration_date"] == DT, "client_id"])
+    assert set(benign_events["event_type"]) <= set(generator.BENIGN_EVENT_TYPES)
+
+
+def test_legit_lookalikes(profiles, cfg):
+    busy = replace(cfg, misconfigured_scope_rate_per_day=0.1, foreign_region_rate_per_day=0.1)
+    events, truth, benign = generator.generate_day(profiles, DT, busy)
+    assert {"misconfigured_scope", "foreign_region"} <= set(benign["event_type"])
+    assert not set(benign["client_id"]) & set(truth["client_id"])  # lookalikes are never attacks
+    net = generator.network_for_day(profiles, DT, busy).set_index("client_id")
+    for _, b in benign[benign["event_type"] == "misconfigured_scope"].iterrows():
+        mine = events[(events["client_id"] == b["client_id"]) & (events["status_code"] == 400)]
+        assert len(mine) > 0
+        assert mine["source_ip"].map(subnet_of).isin(net.loc[b["client_id"], "home_subnets"].split()).all()
+    for _, b in benign[benign["event_type"] == "foreign_region"].iterrows():
+        abroad = events[(events["client_id"] == b["client_id"]) & (events["country"] != "BR")]
+        lo, hi = generator.FOREIGN_REGION_REQUESTS
+        assert lo <= len(abroad) <= hi and (abroad["status_code"] == 200).all()
