@@ -20,10 +20,12 @@ This project turns that traffic into a daily, **explainable** risk score per cli
 
 ```mermaid
 flowchart LR
-    G[Synthetic OAuth<br/>traffic generator] --> B[(bronze<br/>oauth_events<br/>client_profile<br/>ground_truth)]
+    G[Synthetic OAuth<br/>traffic generator] --> B[(bronze<br/>oauth_events<br/>client_profile<br/>ground_truth<br/>benign_events)]
     B --> Q{Data quality<br/>checks}
-    Q --> S[(silver<br/>client_daily<br/>ip_daily)]
+    Q --> S[(silver<br/>client_daily<br/>ip_daily<br/>client_subnet_daily)]
+    S --> L[(silver<br/>client_subnet_baseline<br/>last 14 days)]
     S --> R[(gold<br/>risk_scores<br/>detection_metrics)]
+    L --> R
     R --> A[Athena / SQL]
     subgraph Airflow DAG: oauth_shield_daily
         G
@@ -40,10 +42,13 @@ flowchart LR
 | Layer | Table | Content |
 |---|---|---|
 | bronze | `oauth_events` | One row per token request: client, source IP, country, requested scope, HTTP status |
-| bronze | `client_profile` | Registry of client apps: allowed scopes, usual IPs, expected daily volume |
+| bronze | `client_profile` | Declared registry of client apps: allowed scopes, registered IPs, expected daily volume. Only updated when a client reports a change |
 | bronze | `ground_truth` | Which clients were attacked that day, and how (used only for evaluation) |
+| bronze | `benign_events` | Legitimate behaviour that looks suspicious: subnet migrations, misconfigured releases, foreign cloud regions (used only to explain false positives) |
 | silver | `client_daily` | Daily success/error counts, invalid scopes, off-baseline IPs, foreign traffic per client |
 | silver | `ip_daily` | Requests, failures and distinct clients per source IP |
+| silver | `client_subnet_daily` | Requests, tokens issued and scope errors per client and /24 subnet |
+| silver | `client_subnet_baseline` | The /24 subnets each app *usually* issues tokens from, learned from the previous 14 days (the subnets covering 95% of its tokens) |
 | gold | `risk_scores` | 0–100 score, LOW/MEDIUM/HIGH level and the reasons that fired, per client |
 | gold | `detection_metrics` | Precision and recall of HIGH flags vs. ground truth |
 
@@ -57,11 +62,21 @@ Every table is partitioned by `dt=YYYY-MM-DD`. Athena discovers new partitions t
 | `s_suspicious_ip` | ≥ 10 hits from an IP that failed on ≥ 10 different clients | 40 | Credential stuffing / spraying |
 | `s_foreign_geo` | ≥ 5 requests from outside the home country | 40 | Stolen credentials used abroad |
 | `s_volume_burst` | Volume ≥ 3× the expected daily baseline | 25 | Token farming |
-| `s_off_baseline_ip` | ≥ 25% of traffic from IPs never seen for this app | 25 | Infrastructure change or takeover |
+| `s_off_baseline_ip` | ≥ 25% of traffic from IPs not in the declared registry | 25 | Infrastructure change or takeover |
+| `s_new_subnet_scope_errors` | ≥ 5 `invalid_scope` errors from a /24 that is not usual for the app (learned baseline), counted per subnet and never diluted by the app's total volume | 40 | Stolen credentials used once from a new network, probing for scopes, on a high-volume app |
 
 Score = sum of weights, capped at 100. **HIGH ≥ 40**, MEDIUM ≥ 20. Each flagged client carries a human-readable `reasons` string.
 
-**Current results:** about 85k events/day, 300 client apps and 12 injected attacks per day. The rules reach precision 1.0 and recall 1.0. That is expected, because the attacks in this synthetic data are loud by design. The value of the project is the pipeline and the evaluation harness. The roadmap adds stealthier attacks to make the trade-offs visible.
+**Current results** (30-day backfill, 2026-10-24 to 2026-11-22): about 127k events/day from 300 client apps, with 12 injected attacks per day. The first 14 days only build the subnet baseline. On the 16 days where it is ready:
+
+| Metric | Mean | Worst day |
+|---|---|---|
+| Precision | 0.75 | 0.60 |
+| Recall | 0.78 | 0.67 |
+
+- Recall by attack type: geo anomaly 0.94, credential stuffing 0.83, new-subnet probing 0.81, volume burst 0.72, scope probing 0.65.
+- All 54 false positives come from legitimate lookalikes the generator plants on purpose. They are logged in `benign_events`: 32 misconfigured scopes, 21 trips abroad and 1 network migration that the client did not notify. The design accepts a false positive rather than loosening the rules.
+- `python scripts/simulate.py --end 2026-11-22 --days 30` reproduces these numbers in memory in about a minute, which is how the generator was tuned.
 
 ## Run it locally (no cloud account needed)
 
@@ -77,6 +92,8 @@ docker compose up --build
 1. Open http://localhost:8080 and enable the `oauth_shield_daily` DAG.
 2. Trigger it.
 3. The Parquet output lands in `./data/`.
+4. For 30 days of history (the subnet baseline needs 14), run a backfill one day at a time:
+   `docker compose exec airflow airflow backfill create --dag-id oauth_shield_daily --from-date 2026-10-24 --to-date 2026-11-22 --max-active-runs 1 --reprocess-behavior completed`
 
 ## Run it on AWS
 
@@ -107,14 +124,15 @@ terraform apply
 ```bash
 pip install -r requirements-dev.txt
 pytest -q          # generator, aggregates, risk rules, storage
-ruff check .
+ruff check src tests dags scripts
 ```
 
 On every push, CI runs lint, the tests, `terraform fmt` and `terraform validate`.
 
 ## Roadmap
 
-- [ ] Harder scenarios (low-and-slow attacks, legitimate traffic spikes) and threshold tuning with precision/recall curves
+- [x] Harder scenarios: learned subnet baseline, new-subnet probing, legitimate lookalikes
+- [ ] Threshold tuning with precision/recall curves
 - [ ] Unsupervised scoring (Isolation Forest) compared against the rules
 - [ ] Same-day (D0) detection: stream events through Kafka instead of a daily batch
 - [ ] dbt models for the silver/gold layers
