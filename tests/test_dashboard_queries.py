@@ -1,0 +1,165 @@
+import pandas as pd
+import pytest
+
+from oauth_shield import baseline, risk
+from oauth_shield import dashboard_queries as dq
+from oauth_shield.storage import Storage
+
+D1, D2 = "2026-11-01", "2026-11-02"
+
+
+def _scores(rows):
+    """rows: (client_id, score, level, signals that fired)"""
+    out = []
+    for cid, score, level, fired in rows:
+        row = {"client_id": cid, "risk_score": score, "risk_level": level, "reasons": "; ".join(fired)}
+        row.update({s: s in fired for s in risk.WEIGHTS})
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def _events(dt, rows):
+    """rows: (source_ip, client_id, status_code, count)"""
+    out = []
+    for ip, cid, status, n in rows:
+        out += [
+            {
+                "client_id": cid,
+                "source_ip": ip,
+                "country": "BR",
+                "requested_scope": "payments:read",
+                "status_code": status,
+            }
+        ] * n
+    df = pd.DataFrame(out)
+    df.insert(0, "event_ts", pd.Timestamp(dt))
+    df.insert(0, "event_id", [f"{dt}-{i}" for i in range(len(df))])
+    return df
+
+
+def _metrics(dt, flagged, tp, fp, fn, precision, recall, ready):
+    return pd.DataFrame(
+        [
+            {
+                "run_date": dt,
+                "flagged": flagged,
+                "true_positives": tp,
+                "false_positives": fp,
+                "false_negatives": fn,
+                "precision": precision,
+                "recall": recall,
+                "baseline_ready": ready,
+            }
+        ]
+    )
+
+
+def _client_daily(rows):
+    cols = ["client_id", "total_requests", "success_count", "invalid_scope_count", "expected_daily_volume"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _subnet_daily(rows):
+    cols = ["client_id", "subnet", "total_requests", "success_count", "invalid_scope_count", "distinct_ips"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+@pytest.fixture
+def dash(tmp_path):
+    """Two tiny, hand-checked days. D1: baseline not ready. D2: ready, and no benign events."""
+    s = Storage(backend="local", data_dir=str(tmp_path))
+    w = s.write
+    w(
+        _scores(
+            [
+                ("a", 80, "HIGH", ["s_scope_probing", "s_foreign_geo"]),
+                ("b", 40, "HIGH", ["s_foreign_geo"]),
+                ("c", 25, "MEDIUM", ["s_volume_burst"]),
+                ("d", 0, "LOW", []),
+            ]
+        ),
+        "gold",
+        "risk_scores",
+        D1,
+    )
+    w(
+        _scores(
+            [
+                ("a", 0, "LOW", []),
+                ("b", 40, "HIGH", ["s_new_subnet_scope_errors"]),
+                ("c", 65, "HIGH", ["s_volume_burst", "s_suspicious_ip"]),
+                ("d", 0, "LOW", []),
+            ]
+        ),
+        "gold",
+        "risk_scores",
+        D2,
+    )
+    w(
+        pd.DataFrame({"client_id": ["a", "d"], "attack_type": ["scope_probing", "credential_stuffing"]}),
+        "bronze",
+        "ground_truth",
+        D1,
+    )
+    w(pd.DataFrame({"client_id": ["c"], "attack_type": ["volume_burst"]}), "bronze", "ground_truth", D2)
+    benign_cols = ["client_id", "event_type", "subnet", "notified"]
+    w(pd.DataFrame([("b", "foreign_region", "", False)], columns=benign_cols), "bronze", "benign_events", D1)
+    w(
+        pd.DataFrame({c: pd.Series(dtype="bool" if c == "notified" else "object") for c in benign_cols}),
+        "bronze",
+        "benign_events",
+        D2,
+    )
+    w(_metrics(D1, 2, 1, 1, 1, 0.5, 0.5, False), "gold", "detection_metrics", D1)
+    w(_metrics(D2, 2, 1, 1, 0, 0.5, 1.0, True), "gold", "detection_metrics", D2)
+    w(
+        _client_daily([("a", 100, 80, 20, 100), ("b", 50, 50, 0, 50), ("c", 300, 300, 0, 100), ("d", 30, 0, 0, 40)]),
+        "silver",
+        "client_daily",
+        D1,
+    )
+    w(
+        _client_daily([("a", 100, 100, 0, 100), ("b", 56, 50, 6, 50), ("c", 400, 395, 0, 100), ("d", 40, 40, 0, 40)]),
+        "silver",
+        "client_daily",
+        D2,
+    )
+    ip_cols = ["source_ip", "country", "total_requests", "failed_requests", "distinct_clients"]
+    w(
+        pd.DataFrame([("9.9.9.9", "BR", 30, 30, 3), ("1.1.1.1", "BR", 100, 0, 1)], columns=ip_cols),
+        "silver",
+        "ip_daily",
+        D1,
+    )
+    w(pd.DataFrame([("9.9.9.9", "BR", 10, 5, 2)], columns=ip_cols), "silver", "ip_daily", D2)
+    w(
+        _events(D1, [("9.9.9.9", c, 401, 10) for c in "abd"] + [("1.1.1.1", "a", 200, 100)]),
+        "bronze",
+        "oauth_events",
+        D1,
+    )
+    w(_events(D2, [("9.9.9.9", "b", 200, 5), ("9.9.9.9", "c", 401, 5)]), "bronze", "oauth_events", D2)
+    w(_subnet_daily([("b", "7.7.7.0/24", 9, 0, 9, 1)]), "silver", "client_subnet_daily", D1)
+    w(
+        _subnet_daily([("b", "1.1.1.0/24", 50, 50, 0, 2), ("b", "5.5.5.0/24", 6, 0, 6, 1)]),
+        "silver",
+        "client_subnet_daily",
+        D2,
+    )
+    w(baseline.build_baseline(pd.DataFrame(), 0), "silver", "client_subnet_baseline", D1)
+    hist = _subnet_daily([("b", "1.1.1.0/24", 50, 50, 0, 2)]).assign(dt="2026-10-31")
+    w(baseline.build_baseline(hist, 14), "silver", "client_subnet_baseline", D2)
+    for dt in (D1, D2):
+        w(pd.DataFrame({"client_id": ["a"]}), "bronze", "client_profile", dt)
+    return tmp_path
+
+
+def test_missing_tables_on_empty_dir(tmp_path):  # Review Focus 1
+    con = dq.connect(tmp_path)
+    assert dq.missing_tables(con) == list(dq.TABLES)
+
+
+def test_connect_full_dataset(dash):
+    con = dq.connect(dash)
+    assert dq.missing_tables(con) == []
+    assert dq.available_dates(con) == [D1, D2]
