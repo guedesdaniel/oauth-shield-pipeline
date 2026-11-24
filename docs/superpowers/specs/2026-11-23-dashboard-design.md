@@ -1,6 +1,6 @@
 # Dashboard local de análise (Streamlit + DuckDB) — design
 
-Status: aguardando aprovação · Data: 2026-11-24 · Frente 2 (a frente 1, dados de 30 dias, já está na `main`)
+Status: aguardando aprovação · Data: 2026-11-23 · Frente 2 (a frente 1, dados de 30 dias, já está na `main`)
 
 ## 1. Intenção
 
@@ -60,7 +60,7 @@ O dono deixou o "como" comigo. Fiquei com A.
 | `dashboard/app.py` | Casca Streamlit: lateral, abas, gráficos e tabelas. Não tem SQL próprio, só chama as funções acima. |
 | `requirements-dashboard.txt` | `streamlit`, `duckdb`. O Altair já vem junto com o Streamlit. |
 | `requirements-dev.txt` | Ganha `duckdb`, para os testes de consulta rodarem no CI. |
-| `Dockerfile.dashboard` + serviço `dashboard` no `docker-compose.yaml` | Porta 8501 e `./data` montado só para leitura. Assim `docker compose up` sobe Airflow e dashboard juntos. |
+| `Dockerfile.dashboard` + serviço `dashboard` no `docker-compose.yaml` | Imagem `python:3.12-slim` com `requirements-dashboard.txt`. Monta `./data:/data:ro`, `./src` e `./dashboard`, com `DATA_DIR=/data` e porta 8501. Assim `docker compose up` sobe Airflow e dashboard juntos. |
 | `tests/test_dashboard_queries.py` | Testes das consultas, sobre Parquet minúsculos gravados com `Storage`. |
 
 Há dois jeitos de rodar:
@@ -82,6 +82,8 @@ SELECT * FROM read_parquet('<data_dir>/gold/risk_scores/*/*.parquet',
 - Uma tabela sem nenhum arquivo não ganha view. `missing_tables(con) -> list[str]` diz quais faltam, e a tela mostra "rode a DAG ou o backfill primeiro (Etapa 2b do COMO_COMECAR)" em vez de quebrar.
 - `data_dir` vem da variável `DATA_DIR`, com padrão `data`.
 - No Streamlit, a conexão fica em `st.cache_resource`.
+- Os intervalos `start`/`end` são inclusivos, como datas `YYYY-MM-DD`.
+- O `app.py` coloca `src/` no `sys.path`, como o `scripts/simulate.py`, porque o pacote não é instalado no venv.
 
 **Definições que todas as funções seguem**
 
@@ -109,7 +111,7 @@ SELECT * FROM read_parquet('<data_dir>/gold/risk_scores/*/*.parquet',
 
 | Elemento | Função | Conteúdo |
 |---|---|---|
-| Ranking de IPs | `suspicious_ips(con, start, end, limit=50)` | Sai de `ip_daily`, só com IPs que tiveram falha. Por IP: país, dias em que apareceu, máximo de apps atingidos num dia, total de falhas, % de falha e "atacou um app que era ataque real?". A ordem é apps atingidos desc, depois falhas desc. |
+| Ranking de IPs | `suspicious_ips(con, start, end, limit=50)` | Sai de `ip_daily`, só com IPs que tiveram falha. Por IP: país, dias em que apareceu, máximo de apps atingidos num dia, total de falhas, % de falha e "atacou um app que era ataque real?". Esta última coluna cruza `bronze/oauth_events` (IP, dt e app) com `ground_truth` do mesmo dt. A ordem é apps atingidos desc, depois falhas desc. |
 | Subnets fora do usual com erro de scope | `unusual_subnet_scope_errors(con, start, end, min_errors=5)` | É a query 5 do Athena, com um ajuste: só entram os dias com régua pronta, o que resolve a pendência menor da frente 1. A tabela traz dt, app, subnet, erros de scope, sucessos e se o app era ataque real. |
 
 ### 5.6 Aba 3: Detalhe
