@@ -44,7 +44,8 @@ def connect(data_dir: str | Path) -> duckdb.DuckDBPyConnection:
             f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{pattern.replace(chr(39), chr(39) * 2)}', "
             "hive_partitioning = true, hive_types = {'dt': DATE})"
         )
-    con.execute("CREATE TEMP TABLE _missing (pos INTEGER, name VARCHAR)")
+    # A regular (not TEMP) table, so per-session cursors (con.cursor()) see it too.
+    con.execute("CREATE TABLE _missing (pos INTEGER, name VARCHAR)")
     if missing:
         order = list(TABLES)
         con.executemany("INSERT INTO _missing VALUES (?, ?)", [(order.index(t), t) for t in missing])
