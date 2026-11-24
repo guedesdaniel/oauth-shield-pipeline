@@ -162,3 +162,72 @@ def day_errors(con: duckdb.DuckDBPyConnection, dt: str) -> pd.DataFrame:
         """,
         [dt, dt],
     )
+
+
+# ---------------------------------------------------------------- IPs suspeitos
+def suspicious_ips(con: duckdb.DuckDBPyConnection, start: str, end: str, limit: int = 50) -> pd.DataFrame:
+    """IPs with at least one failure in the range, the ones hitting the most apps first."""
+    return _df(
+        con,
+        f"""
+        WITH agg AS (
+            SELECT source_ip, mode(country) AS country, count(DISTINCT dt) AS days_seen,
+                   max(distinct_clients) AS max_clients,
+                   CAST(sum(failed_requests) AS BIGINT) AS failed, CAST(sum(total_requests) AS BIGINT) AS total
+            FROM ip_daily WHERE {_RANGE}
+            GROUP BY 1 HAVING sum(failed_requests) > 0
+        ), hit AS (
+            SELECT DISTINCT e.source_ip
+            FROM oauth_events e JOIN ground_truth g ON g.dt = e.dt AND g.client_id = e.client_id
+            WHERE e.{_RANGE} AND e.source_ip IN (SELECT source_ip FROM agg)
+        )
+        SELECT agg.*, round(failed / total, 3) AS fail_ratio,
+               source_ip IN (SELECT source_ip FROM hit) AS hit_real_attack
+        FROM agg
+        ORDER BY max_clients DESC, failed DESC, source_ip
+        LIMIT ?
+        """,
+        [start, end, start, end, limit],
+    )
+
+
+def unusual_subnet_scope_errors(
+    con: duckdb.DuckDBPyConnection, start: str, end: str, min_errors: int = 5
+) -> pd.DataFrame:
+    """Athena query 5, on baseline-ready days only: scope errors from a /24 the app does not usually use."""
+    return _df(
+        con,
+        f"""
+        SELECT strftime(d.dt, '%Y-%m-%d') AS dt, d.client_id, d.subnet, d.invalid_scope_count,
+               d.success_count, d.total_requests, {_IS_ATTACK.format(t="d")} AS is_attack
+        FROM client_subnet_daily d
+        JOIN detection_metrics m ON m.dt = d.dt AND m.baseline_ready
+        LEFT JOIN client_subnet_baseline b ON b.dt = d.dt AND b.client_id = d.client_id AND b.subnet = d.subnet
+        WHERE d.{_RANGE} AND d.invalid_scope_count >= ? AND coalesce(b.is_usual, false) = false
+        ORDER BY d.dt DESC, d.invalid_scope_count DESC, d.client_id
+        """,
+        [start, end, min_errors],
+    )
+
+
+def ip_activity(con: duckdb.DuckDBPyConnection, ip: str, start: str, end: str) -> pd.DataFrame:
+    """What one IP did, per day and app, from the raw events."""
+    return _df(
+        con,
+        f"""
+        WITH a AS (
+            SELECT dt, client_id, count(*) AS requests,
+                   count(*) FILTER (status_code = 200) AS s200,
+                   count(*) FILTER (status_code = 400) AS s400,
+                   count(*) FILTER (status_code = 401) AS s401,
+                   string_agg(DISTINCT country, ', ' ORDER BY country) AS countries,
+                   string_agg(DISTINCT requested_scope, ', ' ORDER BY requested_scope) AS scopes
+            FROM oauth_events WHERE source_ip = ? AND {_RANGE}
+            GROUP BY 1, 2
+        )
+        SELECT strftime(a.dt, '%Y-%m-%d') AS dt, client_id, requests, s200, s400, s401, countries, scopes,
+               {_IS_ATTACK.format(t="a")} AS is_attack
+        FROM a ORDER BY a.dt, client_id
+        """,
+        [ip, start, end],
+    )

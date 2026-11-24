@@ -215,3 +215,42 @@ def test_day_errors_unexplained_fp(dash):  # Review Focus 2
     assert df[["kind", "client_id", "explanation"]].to_dict("records") == [
         {"kind": "falso positivo", "client_id": "b", "explanation": "sem explicação"}
     ]
+
+
+def test_suspicious_ips(dash):
+    df = dq.suspicious_ips(dq.connect(dash), D1, D2)
+    assert df.to_dict("records") == [
+        {
+            "source_ip": "9.9.9.9",
+            "country": "BR",
+            "days_seen": 2,
+            "max_clients": 3,
+            "failed": 35,
+            "total": 40,
+            "fail_ratio": 0.875,
+            "hit_real_attack": True,
+        }
+    ]
+
+
+def test_unusual_subnet_scope_errors_ready_days_only(dash):
+    df = dq.unusual_subnet_scope_errors(dq.connect(dash), D1, D2)
+    assert df[["dt", "client_id", "subnet", "invalid_scope_count", "is_attack"]].to_dict("records") == [
+        {"dt": D2, "client_id": "b", "subnet": "5.5.5.0/24", "invalid_scope_count": 6, "is_attack": False}
+    ]  # D1 (7.7.7.0/24, 9 errors) is left out: baseline not ready
+
+
+def test_ip_activity(dash):
+    df = dq.ip_activity(dq.connect(dash), "9.9.9.9", D1, D2)
+    assert df[["dt", "client_id", "requests", "s200", "s401", "is_attack"]].to_dict("records") == [
+        {"dt": D1, "client_id": "a", "requests": 10, "s200": 0, "s401": 10, "is_attack": True},
+        {"dt": D1, "client_id": "b", "requests": 10, "s200": 0, "s401": 10, "is_attack": False},
+        {"dt": D1, "client_id": "d", "requests": 10, "s200": 0, "s401": 10, "is_attack": True},
+        {"dt": D2, "client_id": "b", "requests": 5, "s200": 5, "s401": 0, "is_attack": False},
+        {"dt": D2, "client_id": "c", "requests": 5, "s200": 0, "s401": 5, "is_attack": True},
+    ]
+
+
+def test_ip_activity_unknown_ip(dash):  # Review Focus 5
+    df = dq.ip_activity(dq.connect(dash), "0.0.0.0", D1, D2)
+    assert df.empty and "is_attack" in df.columns
