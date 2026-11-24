@@ -39,5 +39,17 @@ services:
       postgres:
         condition: service_healthy
 
+  # Read-only analytics over ./data. UI: http://localhost:8501
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/data:ro
+      - ./src:/app/src:ro
+      - ./dashboard:/app/dashboard:ro
+
 volumes:
   postgres-data:

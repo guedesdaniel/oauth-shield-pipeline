@@ -95,6 +95,25 @@ docker compose up --build
 4. For 30 days of history (the subnet baseline needs 14), run a backfill one day at a time:
    `docker compose exec airflow airflow backfill create --dag-id oauth_shield_daily --from-date 2026-10-24 --to-date 2026-11-22 --max-active-runs 1 --reprocess-behavior completed`
 
+## Dashboard (local)
+
+![OAuth Shield dashboard](docs/img/dashboard.png)
+
+A Streamlit app reads the Parquet layers with DuckDB. It only reads what the pipeline wrote: no score or metric is recomputed, and precision and recall come from `detection_metrics`.
+
+- **Overview.** Shows the day's cards (HIGH, MEDIUM, real attacks, precision, recall) and a chart of HIGH apps per day, split into real attacks and false positives. Baseline warm-up days are shaded. Two more charts show signals per day as a heatmap and caught vs. missed attacks by type. The day's errors are listed too: each false positive comes with the legitimate event that explains it, and each missed attack with its type.
+- **Suspicious IPs.** Ranks IPs that failed on the most apps. It also lists scope errors coming from a /24 that the app does not usually use.
+- **Detail.** For one app, shows volume against expected volume per day, with HIGH days marked, plus its reasons, the ground truth and its subnets against the learned baseline. For one IP, lists every app it called, by day and status code.
+
+Run it with `docker compose up` (service `dashboard`, http://localhost:8501), or from a virtualenv:
+
+```bash
+pip install -r requirements-dashboard.txt
+streamlit run dashboard/app.py      # DATA_DIR defaults to ./data
+```
+
+The queries live in [`src/oauth_shield/dashboard_queries.py`](src/oauth_shield/dashboard_queries.py) and are unit-tested on a tiny hand-checked dataset.
+
 ## Run it on AWS
 
 Requirements: an AWS account, the AWS CLI configured with an admin profile, and Terraform ≥ 1.6.
@@ -132,6 +151,7 @@ On every push, CI runs lint, the tests, `terraform fmt` and `terraform validate`
 ## Roadmap
 
 - [x] Harder scenarios: learned subnet baseline, new-subnet probing, legitimate lookalikes
+- [x] Local analytics dashboard (Streamlit + DuckDB)
 - [ ] Threshold tuning with precision/recall curves
 - [ ] Unsupervised scoring (Isolation Forest) compared against the rules
 - [ ] Same-day (D0) detection: stream events through Kafka instead of a daily batch

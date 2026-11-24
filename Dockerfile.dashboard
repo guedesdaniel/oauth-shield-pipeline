@@ -1,0 +1,12 @@
+# Local dashboard (Streamlit + DuckDB). Code and data are bind-mounted by docker-compose.
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt requirements-dashboard.txt ./
+RUN pip install --no-cache-dir -r requirements-dashboard.txt
+
+ENV PYTHONPATH=/app/src \
+    DATA_DIR=/data
+
+EXPOSE 8501
+CMD ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
