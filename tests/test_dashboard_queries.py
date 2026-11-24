@@ -254,3 +254,31 @@ def test_ip_activity(dash):
 def test_ip_activity_unknown_ip(dash):  # Review Focus 5
     df = dq.ip_activity(dq.connect(dash), "0.0.0.0", D1, D2)
     assert df.empty and "is_attack" in df.columns
+
+
+def test_app_options(dash):
+    df = dq.app_options(dq.connect(dash), D1, D2)
+    assert list(df["client_id"]) == ["a", "c", "b", "d"] and list(df["max_score"]) == [80, 65, 40, 0]
+
+
+def test_app_timeline(dash):
+    df = dq.app_timeline(dq.connect(dash), "c", D1, D2)
+    assert df[["dt", "risk_level", "truth"]].to_dict("records") == [
+        {"dt": D1, "risk_level": "MEDIUM", "truth": None},
+        {"dt": D2, "risk_level": "HIGH", "truth": "volume_burst"},
+    ]
+    b = dq.app_timeline(dq.connect(dash), "b", D1, D1)
+    assert b["truth"].tolist() == ["foreign_region"]
+
+
+def test_app_timeline_unknown_app(dash):  # Review Focus 5
+    df = dq.app_timeline(dq.connect(dash), "zzz", D1, D2)
+    assert df.empty and "truth" in df.columns
+
+
+def test_app_subnets_status(dash):  # Review Focus 3: the baseline view also reads D1's empty partition
+    df = dq.app_subnets(dq.connect(dash), "b", D2)
+    assert df[["subnet", "baseline_status"]].to_dict("records") == [
+        {"subnet": "1.1.1.0/24", "baseline_status": "usual"},
+        {"subnet": "5.5.5.0/24", "baseline_status": "nova"},
+    ]

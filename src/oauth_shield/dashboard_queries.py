@@ -231,3 +231,54 @@ def ip_activity(con: duckdb.DuckDBPyConnection, ip: str, start: str, end: str) -
         """,
         [ip, start, end],
     )
+
+
+# ---------------------------------------------------------------- Detalhe
+def app_options(con: duckdb.DuckDBPyConnection, start: str, end: str) -> pd.DataFrame:
+    """Apps for the selector, the riskiest in the range first."""
+    return _df(
+        con,
+        f"SELECT client_id, max(risk_score) AS max_score FROM risk_scores WHERE {_RANGE} "
+        "GROUP BY 1 ORDER BY max_score DESC, client_id",
+        [start, end],
+    )
+
+
+def app_timeline(con: duckdb.DuckDBPyConnection, client_id: str, start: str, end: str) -> pd.DataFrame:
+    """One app day by day: volume vs expected, score and reasons, and what it really was (truth)."""
+    df = _df(
+        con,
+        f"""
+        SELECT strftime(c.dt, '%Y-%m-%d') AS dt, c.total_requests, c.success_count, c.invalid_scope_count,
+               c.expected_daily_volume, r.risk_score, r.risk_level, r.reasons,
+               coalesce(g.attack_type,
+                        (SELECT string_agg(DISTINCT b.event_type, ', ' ORDER BY b.event_type)
+                         FROM benign_events b WHERE b.dt = c.dt AND b.client_id = c.client_id)) AS truth
+        FROM client_daily c
+        LEFT JOIN risk_scores r ON r.dt = c.dt AND r.client_id = c.client_id
+        LEFT JOIN ground_truth g ON g.dt = c.dt AND g.client_id = c.client_id
+        WHERE c.client_id = ? AND c.{_RANGE}
+        ORDER BY c.dt
+        """,
+        [client_id, start, end],
+    )
+    df["truth"] = df["truth"].astype(object).where(df["truth"].notna(), None)
+    return df
+
+
+def app_subnets(con: duckdb.DuckDBPyConnection, client_id: str, dt: str) -> pd.DataFrame:
+    """The app's /24s of the day against the learned baseline of that day (usual / fora do usual / nova)."""
+    return _df(
+        con,
+        f"""
+        SELECT d.subnet, d.total_requests, d.success_count, d.invalid_scope_count,
+               CASE WHEN b.subnet IS NULL THEN 'nova' WHEN b.is_usual THEN 'usual' ELSE 'fora do usual' END
+                   AS baseline_status,
+               b.token_share, b.days_seen
+        FROM client_subnet_daily d
+        LEFT JOIN client_subnet_baseline b ON b.dt = d.dt AND b.client_id = d.client_id AND b.subnet = d.subnet
+        WHERE d.client_id = ? AND d.{_DAY}
+        ORDER BY d.total_requests DESC, d.subnet
+        """,
+        [client_id, dt],
+    )
