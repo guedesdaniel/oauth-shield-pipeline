@@ -282,3 +282,14 @@ def test_app_subnets_status(dash):  # Review Focus 3: the baseline view also rea
         {"subnet": "1.1.1.0/24", "baseline_status": "usual"},
         {"subnet": "5.5.5.0/24", "baseline_status": "nova"},
     ]
+
+
+def test_tables_written_after_connect_are_picked_up(tmp_path):
+    """The app caches one connection; data that lands later (first DAG run, backfill) must show up."""
+    con = dq.connect(tmp_path)
+    assert "detection_metrics" in dq.missing_tables(con)
+    Storage(backend="local", data_dir=str(tmp_path)).write(
+        _metrics(D1, 0, 0, 0, 0, 0.0, 0.0, False), "gold", "detection_metrics", D1
+    )
+    assert "detection_metrics" not in dq.missing_tables(con)
+    assert dq.available_dates(con) == [D1]

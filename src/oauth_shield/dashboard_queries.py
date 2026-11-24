@@ -34,27 +34,34 @@ SIGNALS: list[str] = list(risk.WEIGHTS)
 def connect(data_dir: str | Path) -> duckdb.DuckDBPyConnection:
     """In-memory DuckDB with one view per table that has at least one Parquet file on disk."""
     con = duckdb.connect()
-    missing = []
-    for table, layer in TABLES.items():
-        pattern = (Path(data_dir) / layer / table / "*" / "*.parquet").as_posix()
-        if not glob.glob(pattern):
-            missing.append(table)
-            continue
-        con.execute(
-            f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{pattern.replace(chr(39), chr(39) * 2)}', "
-            "hive_partitioning = true, hive_types = {'dt': DATE})"
-        )
     # A regular (not TEMP) table, so per-session cursors (con.cursor()) see it too.
-    con.execute("CREATE TABLE _missing (pos INTEGER, name VARCHAR)")
-    if missing:
-        order = list(TABLES)
-        con.executemany("INSERT INTO _missing VALUES (?, ?)", [(order.index(t), t) for t in missing])
+    con.execute("CREATE TABLE _config (data_dir VARCHAR)")
+    con.execute("INSERT INTO _config VALUES (?)", [Path(data_dir).as_posix()])
+    missing_tables(con)
     return con
 
 
 def missing_tables(con: duckdb.DuckDBPyConnection) -> list[str]:
-    """Tables with no Parquet file yet, in TABLES order (the dashboard asks for a DAG run/backfill)."""
-    return [r[0] for r in con.execute("SELECT name FROM _missing ORDER BY pos").fetchall()]
+    """Tables with no Parquet file yet, in TABLES order (the dashboard asks for a DAG run/backfill).
+
+    Re-checks the disk on every call and creates the views of tables that appeared since connect(),
+    so a cached connection picks up the first DAG run or a backfill without a restart.
+    """
+    (data_dir,) = con.execute("SELECT data_dir FROM _config").fetchone()
+    views = {r[0] for r in con.execute("SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall()}
+    missing = []
+    for table, layer in TABLES.items():
+        if table in views:
+            continue
+        pattern = f"{data_dir}/{layer}/{table}/*/*.parquet"
+        if not glob.glob(pattern):
+            missing.append(table)
+            continue
+        con.execute(
+            f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet('{pattern.replace(chr(39), chr(39) * 2)}', "
+            "hive_partitioning = true, hive_types = {'dt': DATE})"
+        )
+    return missing
 
 
 def available_dates(con: duckdb.DuckDBPyConnection) -> list[str]:
