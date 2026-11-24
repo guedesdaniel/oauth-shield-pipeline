@@ -163,3 +163,55 @@ def test_connect_full_dataset(dash):
     con = dq.connect(dash)
     assert dq.missing_tables(con) == []
     assert dq.available_dates(con) == [D1, D2]
+
+
+def test_day_summary(dash):
+    s = dq.day_summary(dq.connect(dash), D1)
+    assert s == {"high": 2, "medium": 1, "attacks": 2, "precision": 0.5, "recall": 0.5, "baseline_ready": False}
+
+
+def test_daily_outcomes(dash):
+    df = dq.daily_outcomes(dq.connect(dash), D1, D2)
+    assert df.to_dict("records") == [
+        {"dt": D1, "outcome": "ataque real", "n": 1, "baseline_ready": False},
+        {"dt": D1, "outcome": "falso positivo", "n": 1, "baseline_ready": False},
+        {"dt": D2, "outcome": "ataque real", "n": 1, "baseline_ready": True},
+        {"dt": D2, "outcome": "falso positivo", "n": 1, "baseline_ready": True},
+    ]
+
+
+def test_daily_outcomes_single_day(dash):  # Review Focus 4
+    assert len(dq.daily_outcomes(dq.connect(dash), D2, D2)) == 2
+
+
+def test_daily_signals(dash):
+    df = dq.daily_signals(dq.connect(dash), D1, D2)
+    got = {(r.dt, r.signal): r.n for r in df.itertuples()}
+    assert got == {
+        (D1, "s_foreign_geo"): 2,
+        (D1, "s_scope_probing"): 1,
+        (D1, "s_volume_burst"): 1,
+        (D2, "s_new_subnet_scope_errors"): 1,
+        (D2, "s_suspicious_ip"): 1,
+        (D2, "s_volume_burst"): 1,
+    }
+
+
+def test_attacks_by_type_only_ready_days(dash):
+    df = dq.attacks_by_type(dq.connect(dash), D1, D2)
+    assert df.to_dict("records") == [{"attack_type": "volume_burst", "caught": 1, "missed": 0, "recall": 1.0}]
+
+
+def test_day_errors_explained(dash):
+    df = dq.day_errors(dq.connect(dash), D1)
+    assert df[["kind", "client_id", "explanation"]].to_dict("records") == [
+        {"kind": "ataque que escapou", "client_id": "d", "explanation": "credential_stuffing"},
+        {"kind": "falso positivo", "client_id": "b", "explanation": "foreign_region"},
+    ]
+
+
+def test_day_errors_unexplained_fp(dash):  # Review Focus 2
+    df = dq.day_errors(dq.connect(dash), D2)
+    assert df[["kind", "client_id", "explanation"]].to_dict("records") == [
+        {"kind": "falso positivo", "client_id": "b", "explanation": "sem explicação"}
+    ]
